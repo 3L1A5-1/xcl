@@ -7198,8 +7198,6 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
-    // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -7210,6 +7208,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             mapped.push(l);
         }
     }
+    // page budget: evicted textures these lists transition are mapped again, uploaded below
+    super::title_textures::revive_listed(&mapped);
+    // textures in title memory the CPU wrote since: uploaded again first
+    super::title_textures::refresh(this);
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
