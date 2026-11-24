@@ -531,6 +531,8 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
 unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> i32;
     let orig = orig!(O_READ_FILE as F);
+    // sparse tiles made read-only (#582) stay writable until the kernel's write is done
+    let _pin = if buf.is_null() { None } else { Some(crate::hle::d3d12x::sparse_cool::pin(buf as usize, n as usize)) };
     if !buf.is_null() {
         crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
     }

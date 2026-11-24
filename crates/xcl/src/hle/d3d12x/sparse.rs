@@ -1313,6 +1313,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    super::sparse_cool::warm(a, n);
     let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
@@ -1329,6 +1330,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    super::sparse_cool::warm(a, n);
     let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
@@ -1444,14 +1446,17 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
-static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// time spent, pages found, looks made and bytes looked at by the write-watch scans
+/// (`refresh_once`), for the timing line
+static WATCH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-pub fn note_watch(t: std::time::Duration, pages: usize) {
+pub fn note_watch(t: std::time::Duration, pages: usize, bytes: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+    WATCH[2].fetch_add(1, Ordering::Relaxed);
+    WATCH[3].fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
@@ -1501,6 +1506,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             x = end;
         }
     }
+    super::sparse_cool::after_look(dirty, MAPPED_GEN.load(Ordering::Acquire), || {
+        s.mapped.iter().filter(|(_, e)| e.holes == 0).map(|(&t, _)| t).collect()
+    });
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
@@ -1531,6 +1539,22 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
                 ms(&PHASES[1]),
                 ms(&PHASES[2]),
                 PHASES[3].load(Ordering::Relaxed)
+            );
+            let looks = WATCH[2].load(Ordering::Relaxed).max(1);
+            let (cool, cooled, warmed, pass_ms) = super::sparse_cool::counts();
+            let made = super::title_textures::ranges_made();
+            crate::xlog_info!(
+                "write-watch look: {:.3} ms and {} MB a look over {} looks (ranges made again {}, filtered again {} in {} ms); sparse tiles read-only {} (cooled {}, warmed {}, cooling pass {:.3} ms a look)",
+                WATCH[0].load(Ordering::Relaxed) as f64 / 1000.0 / looks as f64,
+                WATCH[3].load(Ordering::Relaxed) / looks >> 20,
+                looks,
+                made.0,
+                made.1,
+                made.2 / 1000,
+                cool,
+                cooled,
+                warmed,
+                pass_ms / looks as f64
             );
         }
     }

@@ -313,6 +313,16 @@ static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// those ranges without the sparse tiles made read-only (`sparse_cool`), keyed by the ranges they
+/// were made from and `sparse_cool::gen`: the cooled set changes more often than the ranges
+static COOL_CACHE: Mutex<Option<(Arc<Vec<(usize, usize)>>, u64, Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// times the watched ranges were made again and filtered again for the cooled tiles, and µs in the filter
+static RANGES_MADE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// (watched ranges made again, filtered again for cooled tiles, µs filtering) so far, for the timing line
+pub(super) fn ranges_made() -> (u64, u64, u64) {
+    (RANGES_MADE[0].load(Ordering::Relaxed), RANGES_MADE[1].load(Ordering::Relaxed), RANGES_MADE[2].load(Ordering::Relaxed))
+}
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -660,6 +670,30 @@ thread_local! {
 }
 
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
+    let all = all_watch_ranges(u);
+    if !super::sparse_cool::enabled() {
+        return all;
+    }
+    // read before the filter: a tile warmed while it runs changes it, and the next look filters again
+    let gen = super::sparse_cool::gen();
+    {
+        let g = COOL_CACHE.lock().unwrap();
+        if let Some((ref from, k, ref ranges)) = *g {
+            if k == gen && Arc::ptr_eq(from, &all) {
+                return Arc::clone(ranges);
+            }
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let ends = all.iter().map(|&(a, n)| (a, a + n)).collect();
+    let kept: Arc<Vec<(usize, usize)>> = Arc::new(super::sparse_cool::without_cool(ends).into_iter().map(|(a, b)| (a, b - a)).collect());
+    RANGES_MADE[1].fetch_add(1, Ordering::Relaxed);
+    RANGES_MADE[2].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    *COOL_CACHE.lock().unwrap() = Some((Arc::clone(&all), gen, Arc::clone(&kept)));
+    kept
+}
+
+fn all_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let key = (
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
@@ -680,6 +714,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
+    RANGES_MADE[0].fetch_add(1, Ordering::Relaxed);
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -753,7 +788,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    super::sparse::note_watch(watch_t0.elapsed(), dirty_len, ranges.iter().map(|r| r.1).sum());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)

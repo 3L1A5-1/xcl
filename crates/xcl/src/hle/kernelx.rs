@@ -244,6 +244,7 @@ const MEM_64K_PAGES: u32 = 0x2040_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
+    crate::hle::d3d12x::sparse_cool::warm(a, n);
     let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
     if !q.is_null() {
         crate::hle::d3d12x::sparse::committed(q as usize, n);
@@ -493,10 +494,14 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    crate::hle::d3d12x::sparse_cool::warm(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    if proc_ == windows_sys::Win32::System::Threading::GetCurrentProcess() || windows_sys::Win32::System::Threading::GetProcessId(proc_) == windows_sys::Win32::System::Threading::GetCurrentProcessId() {
+        crate::hle::d3d12x::sparse_cool::warm(addr as usize, size);
+    }
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
 }
 
@@ -757,6 +762,8 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
         | mem::PAGE_EXECUTE_READ
         | mem::PAGE_EXECUTE_READWRITE
         | mem::PAGE_EXECUTE_WRITECOPY;
+    // a sparse tile XCL made read-only for its write-watch look (#582) shows as the title left it
+    (*mbi).Protect = crate::hle::d3d12x::sparse_cool::as_title_sees((*mbi).BaseAddress as usize, (*mbi).Protect);
     let protect = (*mbi).Protect;
     let cpu = (*mbi).State == mem::MEM_COMMIT && (protect & mem::PAGE_GUARD) == 0 && (protect & READABLE) != 0;
     let gpu = xmem_gpu_visible(address);
@@ -2167,6 +2174,35 @@ mod tests {
         assert_eq!(sleep_hold_min(Some("0")), None);
         assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
         assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
+
+    /// A sparse tile XCL made read-only for the write-watch look (#582) looks read-write to the
+    /// title: `XMemVirtualQuery` reports it so, and a same-process `VirtualProtectEx` warms it
+    /// first (old protection read-write, the tile back in the look).
+    #[test]
+    fn a_cooled_sparse_tile_looks_read_write_to_the_title() {
+        use crate::hle::d3d12x::sparse_cool;
+        const TILE: usize = 0x1_0000;
+        unsafe {
+            sparse_cool::enable_on_this_thread_for_test();
+            let p = mem::VirtualAlloc(std::ptr::null(), TILE, mem::MEM_RESERVE | mem::MEM_COMMIT | 0x0020_0000, mem::PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            let mut buf = [std::ptr::null_mut::<c_void>(); 16];
+            let (mut n, mut gran) = (buf.len(), 0u32);
+            mem::GetWriteWatch(1, p as *const c_void, TILE, buf.as_mut_ptr(), &mut n, &mut gran);
+            assert!(sparse_cool::cool_for_test(p));
+            assert!(sparse_cool::is_cooled(p));
+
+            let mut info = [0u64; 8];
+            assert_ne!(XMemVirtualQuery(thr::GetCurrentProcess(), p as *const c_void, info.as_mut_ptr().cast()), 0);
+            assert_eq!((*info.as_ptr().cast::<mem::MEMORY_BASIC_INFORMATION>()).Protect, mem::PAGE_READWRITE);
+
+            let mut old = 0u32;
+            assert_ne!(VirtualProtectEx(thr::GetCurrentProcess(), p as *const c_void, TILE, mem::PAGE_READWRITE, &mut old), 0);
+            assert_eq!(old, mem::PAGE_READWRITE);
+            assert!(!sparse_cool::is_cooled(p));
+            mem::VirtualFree(p as *mut c_void, 0, mem::MEM_RELEASE);
+        }
     }
 
     #[test]

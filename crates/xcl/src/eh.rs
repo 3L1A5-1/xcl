@@ -247,6 +247,9 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
 
 fn is_writable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    // sparse tiles made read-only for the write-watch look (#582) are the title's writable
+    // memory: the emulated CLZERO writes them as the CPU would after the fault
+    crate::hle::d3d12x::sparse_cool::warm(va, bytes);
     // a committed window of unified memory is read-write as a whole and is not asked about, as in
     // `gpu::shader::readable`: `VirtualQuery` walks a region to its end to size it, and a title's
     // memset there asked at every emulated CLZERO loop
@@ -973,6 +976,26 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sparse tile made read-only for the write-watch look is writable to the emulated CLZERO
+    /// (it is warmed first), so the title gets the zeroed line, not the illegal instruction.
+    #[test]
+    fn is_writable_warms_a_cooled_sparse_tile() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const TILE: usize = 0x1_0000;
+        unsafe {
+            crate::hle::d3d12x::sparse_cool::enable_on_this_thread_for_test();
+            let p = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT | 0x0020_0000, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            let mut buf = [std::ptr::null_mut::<std::ffi::c_void>(); 16];
+            let (mut n, mut gran) = (buf.len(), 0u32);
+            windows_sys::Win32::System::Memory::GetWriteWatch(1, p as *const _, TILE, buf.as_mut_ptr(), &mut n, &mut gran);
+            assert!(crate::hle::d3d12x::sparse_cool::cool_for_test(p));
+            assert!(is_writable(p + 128, 64));
+            std::ptr::write_volatile((p + 128) as *mut u64, 0);
+            VirtualFree(p as *mut std::ffi::c_void, 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
