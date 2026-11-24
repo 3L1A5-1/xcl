@@ -541,6 +541,10 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    // memory committed in a graphics reservation: the texture pages there follow it
+    if !q.is_null() && t & mem::MEM_COMMIT != 0 && in_graphics_reservation(q as usize) {
+        crate::hle::d3d12x::vram::title_memory_changed(q as usize, size);
+    }
     q
 }
 
@@ -650,7 +654,12 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
+    // (a release: the whole reservation, before it is forgotten)
+    let gone = in_graphics_reservation(addr as usize).then(|| if t & 0x8000 != 0 { GRAPHICS_RESERVATIONS.lock().unwrap().get(&(addr as usize)).copied().unwrap_or(0) } else { size });
     let ok = mem::VirtualFree(addr, size, t);
+    if let Some(n) = gone.filter(|_| ok != 0) {
+        crate::hle::d3d12x::vram::title_memory_changed(addr as usize, n);
+    }
     if ok != 0 && t & 0x8000 != 0 {
         let released = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
         if let Some(len) = released {
@@ -1686,6 +1695,10 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         away.at.insert(at, p);
         away.page.insert(p, at);
         away.title.insert(at, p);
+    }
+    // pages mapped or unmapped in a graphics reservation: the texture pages there follow them
+    if in_graphics_reservation(base) {
+        crate::hle::d3d12x::vram::title_memory_changed(base, n * PHYS_PAGE);
     }
     va
 }
