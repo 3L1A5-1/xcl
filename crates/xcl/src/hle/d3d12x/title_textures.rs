@@ -537,6 +537,11 @@ fn source_of(va: usize, len: usize) -> Source {
 fn recheck_gpu_view_sources() {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let pages = crate::hle::kernelx::mirrors::take_changed();
+    // the texture pages there follow the method's mapping too (`vram::before_execute`, which
+    // comes after this in the submit): memory where it mapped a page, none where it took it
+    for &(a, b) in &pages {
+        super::vram::title_memory_changed(a, b.saturating_sub(a));
+    }
     let gen = crate::hle::kernelx::gpu_view_map_gen();
     let all = SEEN.swap(gen, Ordering::AcqRel) != gen;
     if !all && pages.is_empty() {

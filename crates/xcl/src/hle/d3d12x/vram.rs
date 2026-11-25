@@ -306,25 +306,38 @@ static BACKING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// the texture pages there follow it before the title's next submit (`before_execute`).
 pub fn title_memory_changed(a: usize, n: usize) {
     if n > 0 {
-        // a CPU view's change is its GPU view's too
+        // a CPU view's change is its GPU view's too, and a GPU view's the CPU view's (a texture
+        // placed in a GPU view with nothing mapped there is at the CPU view's address,
+        // `canonical_va`)
         let gpu = crate::hle::kernelx::mirrors::gpu_of(a);
+        let cpu = crate::hle::kernelx::mirrors::source(a);
         let mut b = BACKING.lock().unwrap();
         b.push((a, n));
-        if let Some(g) = gpu {
-            b.push((g, n));
-        }
+        b.extend(gpu.into_iter().chain(cpu).map(|x| (x, n)));
     }
 }
 
 /// Whether the title has memory at the 64 KiB page `a`: committed, a physical page mapped there,
-/// or one mapped and not touched yet (`lazy`). In a GPU view of the title's CPU memory
-/// (`kernelx::mirrors`) that is the memory of the CPU view behind it.
+/// or one mapped and not touched yet (`lazy`). A GPU view of the title's CPU memory
+/// (`kernelx::mirrors`) shows what the queue's page-mapping method put under it, else a physical
+/// page mapped there, else the memory of the CPU view behind it; an address of a CPU view
+/// (where a texture of its GPU view is placed while nothing is mapped there, `canonical_va`) is
+/// backed also when a GPU view of it shows memory.
 fn title_backed(a: usize) -> bool {
-    let a = crate::hle::kernelx::mirrors::source(a).unwrap_or(a);
+    use crate::hle::kernelx::{lazy, mirrors, physical_page_at};
+    // what a GPU-view address shows (None: nothing says; the CPU view then)
+    let shown = |g: usize| match mirrors::mapped_source(g) {
+        Some(m) => Some(m.is_some()),
+        None => physical_page_at(g).then_some(true),
+    };
+    if let Some(b) = shown(a) {
+        return b;
+    }
+    let src = mirrors::source(a).unwrap_or(a);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let committed = unsafe { VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
-    committed || crate::hle::kernelx::lazy::is_lazy(a) || crate::hle::kernelx::physical_page_at(a)
+    let committed = unsafe { VirtualQuery(src as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
+    committed || lazy::is_lazy(src) || physical_page_at(src) || (src == a && mirrors::gpu_views_of(a).into_iter().any(|g| shown(g) == Some(true)))
 }
 
 /// The ranges of one UpdateTileMappings call over all `total` tiles of a resource: `sel(i)` is
@@ -2652,5 +2665,48 @@ mod tests {
             }
             drop((old, new));
         }
+    }
+
+    /// What a page of a GPU view shows (`title_backed`): the pool page the queue's page-mapping
+    /// method put there, nothing where it unmapped it (or never mapped anything), and the CPU
+    /// view's address of that page (where a texture of the GPU view is placed while nothing is
+    /// mapped there) follows what its GPU view shows. Without the page-mapping method's pages a
+    /// texture there would stay unmapped (read as zero) while the title's streamed data is
+    /// uploaded to it.
+    #[test]
+    fn a_page_the_page_mapping_method_mapped_in_a_gpu_view_is_backed() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use crate::hle::kernelx::mirrors;
+        #[repr(C)]
+        struct Batch {
+            dest: u64,
+            ranges_n: u32,
+            _pad: u32,
+            ranges: usize,
+        }
+        // (addresses far above anything Windows hands out, and a size no other test uses)
+        let (cpu, gpu, size) = (0x7190_0000_0000usize, 0x7196_0000_0000usize, 0x129 * PAGE);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        let pool: Vec<u8> = vec![0; 4 * PAGE];
+        let p = pool.as_ptr() as usize;
+        let call = |at: usize, r: &[[u32; 3]]| unsafe {
+            let b = Batch { dest: at as u64, ranges_n: r.len() as u32, _pad: 0, ranges: r.as_ptr() as usize };
+            assert!(mirrors::apply_batches(1, &b as *const Batch as usize, p, 4).is_some());
+        };
+        let (g, c) = (gpu + 2 * PAGE, cpu + 2 * PAGE);
+        assert!(!title_backed(g) && !title_backed(c), "nothing mapped in either view");
+        call(g, &[[1, 1, 1]]);
+        assert!(title_backed(g), "a pool page mapped by the method");
+        assert!(title_backed(c), "the CPU view's page of a GPU-view page that shows memory");
+        assert!(!title_backed(gpu + 3 * PAGE) && !title_backed(cpu + 3 * PAGE), "the next page is not");
+        call(g, &[[2, 0, 1]]);
+        assert!(!title_backed(g) && !title_backed(c), "unmapped by the method");
+        // the CPU view's change and the GPU view's both reach the pages of either (other tests
+        // note their own ranges here too: only these are looked for)
+        title_memory_changed(g, PAGE);
+        assert!(BACKING.lock().unwrap().contains(&(c, PAGE)), "a GPU view's change is its CPU view's");
+        title_memory_changed(c, PAGE);
+        assert!(BACKING.lock().unwrap().contains(&(g, PAGE)), "a CPU view's change is its GPU view's");
     }
 }
