@@ -88,6 +88,26 @@ impl Source {
         })
     }
 
+    /// Whether every page it reads from is covered by the write-watched spans `watched`.
+    fn fully_watched(&self, size: usize, watched: &[(usize, usize)]) -> bool {
+        self.ranges(size).all(|(s, e)| range_is_fully_watched(s, e - s, watched))
+    }
+
+    /// Bounded content fingerprint of the memory it is read from (`sample_fingerprint` of each run).
+    unsafe fn fingerprint(&self, size: usize) -> u64 {
+        match self {
+            Source::At(a) => sample_fingerprint(*a, size),
+            Source::Pages(runs) => {
+                let mut mix = Vec::with_capacity(runs.len() * 16);
+                for &(off, n, at) in runs.iter().filter(|r| r.2 != 0) {
+                    mix.extend_from_slice(&(off as u64).to_le_bytes());
+                    mix.extend_from_slice(&sample_fingerprint(at, n).to_le_bytes());
+                }
+                content_hash(&mix)
+            }
+        }
+    }
+
     /// Where its first byte is read from, for logs (0: an unmapped page).
     fn first(&self) -> usize {
         match self {
@@ -1049,10 +1069,10 @@ unsafe fn seed_stream_recheck(todo: &[(ID3D12Resource, Upload)], watched: &[(usi
     let mut seeded = Vec::new();
     for (r, (_, src, tex, _)) in todo {
         let size = tex.size() as usize;
-        if size == 0 || range_is_fully_watched(*src, size, watched) {
+        if size == 0 || src.fully_watched(size, watched) {
             continue;
         }
-        let fp = sample_fingerprint(*src, size);
+        let fp = src.fingerprint(size);
         seeded.push((r.as_raw() as usize, StreamRecheck { base_frame: frame, stage: 0, last_fp: fp }));
     }
     if !seeded.is_empty() {
@@ -1103,10 +1123,10 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
                 Some(e) if e.pending => {}
                 Some(e) => {
                     let size = e.tex.size() as usize;
-                    if range_is_fully_watched(e.src, size, watched) {
+                    if e.src.fully_watched(size, watched) {
                         prune.push(res);
                     } else {
-                        check.push((res, e.src, size, prev_fp));
+                        check.push((res, e.src.clone(), size, prev_fp));
                     }
                 }
                 None => {
@@ -1129,7 +1149,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
 
     let results: Vec<(usize, u64, u64)> = check
         .into_iter()
-        .map(|(res, src, size, prev_fp)| (res, prev_fp, sample_fingerprint(src, size)))
+        .map(|(res, src, size, prev_fp)| (res, prev_fp, src.fingerprint(size)))
         .collect();
 
     let mut changed = Vec::new();
@@ -2482,7 +2502,7 @@ mod tests {
         let e_stream = Entry {
             device: 0,
             va,
-            src: va,
+            src: Source::At(va),
             in_gpu_view: false,
             tex: Arc::clone(&tex),
             states: vec![D3D12_RESOURCE_STATE_COMMON],
@@ -2495,7 +2515,7 @@ mod tests {
         let e_gpu = Entry {
             device: 0,
             va: va + size,
-            src: va,
+            src: Source::At(va),
             in_gpu_view: false,
             tex: Arc::clone(&tex),
             states: vec![D3D12_RESOURCE_STATE_COMMON],
