@@ -147,10 +147,38 @@ fn warm_tile(tile: usize) -> bool {
     // SAFETY: `tile` is a committed 64 KiB tile of a sparse window that this module made
     // read-only; restoring read-write changes no contents. A tile decommitted meanwhile makes
     // this fail, which leaves nothing to restore.
-    unsafe { VirtualProtect(tile as *const c_void, TILE, PAGE_READWRITE, &mut old) };
+    if unsafe { VirtualProtect(tile as *const c_void, TILE, PAGE_READWRITE, &mut old) } == 0 {
+        // OURS (port of #1034 review, shelbykb2): the call also fails when only part of the tile
+        // is still committed (a page given back without a warm). The tile has left the set, so
+        // its committed pages must not stay PAGE_READONLY: the next write would fault with
+        // nothing left to warm it.
+        unsafe { restore_committed_runs(tile) };
+    }
     drop(g);
     COUNTS[1].fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// OURS: make each committed read-only run of `tile` read-write, one call per run (the
+/// whole-tile `VirtualProtect` fails when any page of the tile is not committed).
+unsafe fn restore_committed_runs(tile: usize) {
+    let end = tile + TILE;
+    let mut at = tile;
+    while at < end {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+            break;
+        }
+        let run_end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(end);
+        if run_end <= at {
+            break;
+        }
+        if m.State == MEM_COMMIT && m.Protect == PAGE_READONLY {
+            let mut old = 0u32;
+            VirtualProtect(at as *const c_void, run_end - at, PAGE_READWRITE, &mut old);
+        }
+        at = run_end;
+    }
 }
 
 /// A tile warmed for a write that does not fault (a kernel call) is not cooled again for this
@@ -555,6 +583,40 @@ mod tests {
             assert_eq!(protect(p + TILE), PAGE_READWRITE);
             assert_eq!(protect(p + 2 * TILE), PAGE_READONLY, "outside the range");
             warm(p + 2 * TILE, 1);
+            VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// OURS: a cooled tile that lost a page in the middle (decommitted without a warm) is fully
+    /// writable after the warm: the whole-tile `VirtualProtect` fails there, the committed runs
+    /// are restored one by one (#1034 review). Without `restore_committed_runs` the pages before
+    /// and after the hole stay read-only and the next write faults with no tile left to warm.
+    #[test]
+    fn warm_restores_a_cooled_tile_with_a_decommitted_page() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        unsafe {
+            let p = watched(1);
+            written(p, TILE);
+            assert!(cool_tile(p));
+            assert_eq!(protect(p), PAGE_READONLY);
+            // a page in the middle given back behind the cooling pass's back
+            let hole = p + 7 * 0x1000;
+            assert_ne!(VirtualFree(hole as *mut c_void, 0x1000, MEM_DECOMMIT), 0);
+            warm(p, TILE);
+            assert!(!is_cooled(p));
+            for page in 0..TILE / 0x1000 {
+                let a = p + page * 0x1000;
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m));
+                if a == hole {
+                    assert_ne!(m.State, MEM_COMMIT, "the hole stays decommitted");
+                } else {
+                    assert_eq!(m.Protect, PAGE_READWRITE, "page {page} is writable again");
+                }
+            }
+            // a write on either side goes through without a fault
+            std::ptr::write_volatile((p + 8) as *mut u32, 1);
+            std::ptr::write_volatile((p + 9 * 0x1000) as *mut u32, 1);
             VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
         }
     }

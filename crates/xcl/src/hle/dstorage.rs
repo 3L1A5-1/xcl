@@ -814,6 +814,10 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
     crate::hle::kernelx::lazy::ensure(p, n);
+    // OURS (port of #1034 review, 0x6461726B): a sparse tile cooled for the write-watch look
+    // (XCL_SPARSE_COOL) is PAGE_READONLY and fails the protection check below; the title's
+    // memory is writable. `ensure` warms too, this keeps the check independent of that.
+    crate::hle::d3d12x::sparse_cool::warm(p, n);
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
         return true;
     }
@@ -1576,6 +1580,27 @@ mod tests {
         b[0x28..0x30].copy_from_slice(&offset.to_le_bytes());
         b[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
         b
+    }
+
+    /// OURS: a sparse tile cooled for the write-watch look (`XCL_SPARSE_COOL`, PAGE_READONLY) is
+    /// writable memory to a DirectStorage destination check (#1034 review): `writable` warms it.
+    #[test]
+    fn a_cooled_sparse_tile_is_a_writable_destination() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const TILE: usize = 0x1_0000;
+        unsafe {
+            crate::hle::d3d12x::sparse_cool::enable_on_this_thread_for_test();
+            let p = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT | 0x0020_0000, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            let mut buf = [std::ptr::null_mut::<c_void>(); 16];
+            let (mut n, mut gran) = (buf.len(), 0u32);
+            GetWriteWatch(1, p as *const c_void, TILE, buf.as_mut_ptr(), &mut n, &mut gran);
+            assert!(crate::hle::d3d12x::sparse_cool::cool_for_test(p));
+            assert!(crate::hle::d3d12x::sparse_cool::is_cooled(p));
+            assert!(writable(p + 256, 4096), "a cooled tile is a valid destination");
+            assert!(!crate::hle::d3d12x::sparse_cool::is_cooled(p), "and was warmed");
+            VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     #[test]
