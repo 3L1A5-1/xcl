@@ -49,6 +49,18 @@ pub fn uptime() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
+static GUEST: OnceLock<Instant> = OnceLock::new();
+
+/// Records the moment the guest is entered (after the startup shader preparation).
+pub fn mark_guest_entry() {
+    GUEST.get_or_init(Instant::now);
+}
+
+/// Seconds since the guest was entered, `None` before that.
+pub fn guest_uptime() -> Option<f64> {
+    GUEST.get().map(|t| t.elapsed().as_secs_f64())
+}
+
 pub fn init(path: Option<&Path>, level: Level, echo_stderr: bool) {
     START.get_or_init(Instant::now);
     LEVEL.store(level as u8, Ordering::Relaxed);

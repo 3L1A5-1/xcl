@@ -41,6 +41,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         eprintln!("xcl: {e}");
         return 2;
     }
+    crate::log::mark_guest_entry();
     let _ = std::thread::Builder::new().name("xcl-split-counts".into()).spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
         crate::hle::d3d12x::real::log_dispatch_chain_counts();
