@@ -51,12 +51,13 @@ pub fn uptime() -> f64 {
 
 static GUEST: OnceLock<Instant> = OnceLock::new();
 
-/// Records the moment the guest is entered (after the startup shader preparation).
+/// Records the moment the title's entry point is called (after the startup shader preparation
+/// and the loading).
 pub fn mark_guest_entry() {
     GUEST.get_or_init(Instant::now);
 }
 
-/// Seconds since the guest was entered, `None` before that.
+/// Seconds since the title's entry point was called, `None` before that.
 pub fn guest_uptime() -> Option<f64> {
     GUEST.get().map(|t| t.elapsed().as_secs_f64())
 }

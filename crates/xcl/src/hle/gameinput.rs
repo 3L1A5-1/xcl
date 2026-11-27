@@ -12,8 +12,8 @@
 //! State changes enter a half-second history and reach the reading callbacks.
 //! Methods not listed log their slot once and fail.
 //!
-//! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after the guest starts, i.e. after
-//! the startup shader preparation (tests).
+//! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after the title's entry point is
+//! called (the startup shader preparation and loading are not counted) (tests).
 
 #![allow(non_snake_case)]
 
@@ -243,8 +243,9 @@ fn button_named(name: &str) -> Option<u32> {
 
 /// `XCL_PRESS_AT=s:BUTTON,…` ("14:A,18.5:DOWN,20:A"; buttons A B X Y UP DOWN LEFT RIGHT MENU
 /// VIEW LB RB) and `XCL_PRESS_A_AT=s,…`: buttons held for 200 ms at those seconds after the
-/// guest was entered (the startup shader preparation is not counted; the log's times run from
-/// the host's start) – a title's menus walked without a person at the controls.
+/// title's entry point was called (the startup shader preparation and loading are not counted;
+/// the log's times run from the host's start) – a title's menus walked without a person at the
+/// controls.
 fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     let mut v: Vec<(f64, u32)> = a_only.split(',').filter_map(|s| s.trim().parse().ok()).map(|s| (s, A)).collect();
     for item in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -256,8 +257,8 @@ fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     v
 }
 
-/// The scripted buttons held `t` seconds after the guest was entered (`None`: not entered yet,
-/// e.g. the startup shader preparation is still running, so nothing is pressed).
+/// The scripted buttons held `t` seconds after the title's entry point was called (`None`: not
+/// called yet, e.g. the startup shader preparation is still running, so nothing is pressed).
 fn press_held(at: &[(f64, u32)], t: Option<f64>) -> u32 {
     let Some(t) = t else { return 0 };
     at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
@@ -269,8 +270,8 @@ fn scripted() -> u32 {
         let var = |n: &str| std::env::var(n).unwrap_or_default();
         parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
     });
-    // seconds since the guest was entered (not since the host started: shader preparation runs
-    // before the guest and can take longer than the whole script)
+    // seconds since the title's entry point was called (not since the host started: shader
+    // preparation runs before the guest and can take longer than the whole script)
     press_held(at, crate::log::guest_uptime())
 }
 
